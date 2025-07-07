@@ -391,22 +391,25 @@ else
 		pwm_out start
 	fi
 
+	# Start EULER-NAV BAHRS driver.
+	eulernav_bahrs start -d /dev/ttyS6
+
 	#
 	# state estimator selection
-	if param compare -s EKF2_EN 1
-	then
-		ekf2 start &
-	fi
+	#if param compare -s EKF2_EN 1
+	#then
+	#	ekf2 start &
+	#fi
 
-	if param compare -s LPE_EN 1
-	then
-		local_position_estimator start
-	fi
+	#if param compare -s LPE_EN 1
+	#then
+	local_position_estimator start
+	#fi
 
-	if param compare -s ATT_EN 1
-	then
-		attitude_estimator_q start
-	fi
+	#if param compare -s ATT_EN 1
+	#then
+	#	attitude_estimator_q start
+	#fi
 
 	#
 	# Configure vehicle type specific parameters.

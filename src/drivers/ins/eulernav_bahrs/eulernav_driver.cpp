@@ -11,7 +11,7 @@ EulerNavDriver::EulerNavDriver(const char* device_name)
 	, _data_buffer{}
 	, _px4_accel{DRV_INS_DEVTYPE_BAHRS}
 	, _px4_gyro{DRV_INS_DEVTYPE_BAHRS}
-	, _attitude_pub{ORB_ID(vehicle_attitude)}
+	, _attitude_pub{ORB_ID(external_ins_attitude)}
 	, _barometer_pub{ORB_ID(sensor_baro)}
 {
 	initialize();

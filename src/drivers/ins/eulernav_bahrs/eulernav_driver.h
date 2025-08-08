@@ -54,11 +54,11 @@ private:
     struct Config
     {
         static constexpr uint32_t TASK_STACK_SIZE{3072}; ///< Driver task stack size (increased for file I/O)
-        static constexpr uint32_t SERIAL_READ_BUFFER_SIZE{1024}; ///< Buffer size for serial port read operations (increased for high baud rates)
+        static constexpr uint32_t SERIAL_READ_BUFFER_SIZE{1024}; ///< Buffer size for serial port read operations
         static constexpr uint32_t MIN_BYTES_TO_READ{1}; ///< Minimum number of bytes to wait for when reading from a serial port
         static constexpr uint32_t SERIAL_READ_TIMEOUT_US{10000}; ///< A timeout for serial port read operation
-        static constexpr uint32_t DATA_BUFFER_SIZE{4096}; ///< Size of ring buffer for storing RX data stream (increased)
-        static constexpr uint32_t FILE_WRITE_CHUNK_SIZE{512}; ///< Size of chunks to write to file
+        static constexpr uint32_t DATA_BUFFER_SIZE{16384}; ///< Size of ring buffer for storing RX data stream (increased for high baud rates)
+        static constexpr uint32_t FILE_WRITE_CHUNK_SIZE{1024}; ///< Size of chunks to write to file (increased for efficiency)
         static constexpr const char* LOG_DIR_PATH{"/fs/microsd/log/eulernav"}; ///< Log directory path
     };
 

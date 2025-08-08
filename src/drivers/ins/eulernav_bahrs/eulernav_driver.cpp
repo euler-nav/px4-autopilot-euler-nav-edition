@@ -146,6 +146,7 @@ int EulerNavDriver::print_status()
 void EulerNavDriver::run()
 {
     _statistics._start_time = hrt_absolute_time();
+    uint32_t error_count = 0;
 
     while (!should_exit())
     {
@@ -158,11 +159,13 @@ void EulerNavDriver::run()
             if (bytes_read > 0)
             {
                 _statistics._total_bytes_received += bytes_read;
+                error_count = 0; // Reset error counter on success
 
                 // Push to ring buffer
                 if (!_data_buffer.push_back(_serial_read_buffer, bytes_read))
                 {
                     PX4_WARN("Ring buffer overflow, data lost");
+                    // Consider adaptive buffer handling here
                 }
 
                 // Write data to file
@@ -171,9 +174,13 @@ void EulerNavDriver::run()
         }
         else
         {
+            // Use exponential backoff for repeated errors
+            uint32_t delay_ms = 100 * (1 << (error_count > 10 ? 10 : error_count));
+            error_count++; // Increment error counter
+
             // Re-initialize if something failed
             deinitialize();
-            px4_usleep(1000000); // Wait 1 second before retry
+            px4_usleep(delay_ms * 1000); // Adaptive delay
             initialize();
         }
     }
@@ -331,33 +338,58 @@ void EulerNavDriver::writeDataToFile()
         size_t bytes_to_write = _data_buffer.pop_front(_file_write_buffer, Config::FILE_WRITE_CHUNK_SIZE);
 
         if (bytes_to_write > 0) {
-            ssize_t bytes_written = write(_log_fd, _file_write_buffer, bytes_to_write);
+            ssize_t bytes_written = 0;
+            size_t offset = 0;
 
-            if (bytes_written > 0) {
-                _statistics._total_bytes_written += bytes_written;
-            } else {
-                _statistics._write_errors++;
-                PX4_WARN("File write error: %s", strerror(errno));
-                break;
+            // Handle partial writes correctly
+            while (offset < bytes_to_write) {
+                bytes_written = write(_log_fd, _file_write_buffer + offset, bytes_to_write - offset);
+
+                if (bytes_written > 0) {
+                    _statistics._total_bytes_written += bytes_written;
+                    offset += bytes_written;
+                } else if (bytes_written == 0 || (bytes_written < 0 && errno != EINTR)) {
+                    // Real error occurred
+                    _statistics._write_errors++;
+                    PX4_WARN("File write error: %s", strerror(errno));
+                    return; // Exit to allow reinitialization
+                }
+                // If EINTR, just retry
             }
         }
     }
 
-    // Write remaining smaller chunks
+    // Write remaining smaller chunks (with same partial write handling)
     if (_data_buffer.space_used() > 0) {
         size_t remaining = _data_buffer.space_used();
         if (remaining <= Config::FILE_WRITE_CHUNK_SIZE) {
             size_t bytes_to_write = _data_buffer.pop_front(_file_write_buffer, remaining);
 
             if (bytes_to_write > 0) {
-                ssize_t bytes_written = write(_log_fd, _file_write_buffer, bytes_to_write);
+                ssize_t bytes_written = 0;
+                size_t offset = 0;
 
-                if (bytes_written > 0) {
-                    _statistics._total_bytes_written += bytes_written;
-                } else {
-                    _statistics._write_errors++;
+                while (offset < bytes_to_write) {
+                    bytes_written = write(_log_fd, _file_write_buffer + offset, bytes_to_write - offset);
+
+                    if (bytes_written > 0) {
+                        _statistics._total_bytes_written += bytes_written;
+                        offset += bytes_written;
+                    } else if (bytes_written == 0 || (bytes_written < 0 && errno != EINTR)) {
+                        _statistics._write_errors++;
+                        return; // Exit to allow reinitialization
+                    }
                 }
             }
         }
+    }
+
+    // Periodically sync to ensure data is physically written
+    // Only sync every ~1MB to avoid excessive I/O
+    static uint32_t bytes_since_sync = 0;
+    bytes_since_sync += _statistics._total_bytes_written;
+    if (bytes_since_sync > 1048576) { // 1MB
+        fsync(_log_fd);
+        bytes_since_sync = 0;
     }
 }

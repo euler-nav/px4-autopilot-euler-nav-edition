@@ -277,21 +277,24 @@ bool EulerNavDriver::createDirectory(const char* path)
 void EulerNavDriver::generateFilename(char* buffer, size_t buffer_size)
 {
     struct timespec ts;
-    struct tm *tm_info;
+    struct tm tm_info; // Use a local struct for the result
 
     // Try to get current time
     if (clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.tv_sec > 1000000000) {
-        tm_info = localtime(&ts.tv_sec);
-        snprintf(buffer, buffer_size, "%s/eulernav_log_%04d%02d%02d_%02d%02d%02d.bin",
-            Config::LOG_DIR_PATH,
-            tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-            tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
-    } else {
-        // Fallback to sequential numbering
-        static uint32_t file_counter = 0;
-        snprintf(buffer, buffer_size, "%s/eulernav_log_%06" PRIu32 ".bin",
-            Config::LOG_DIR_PATH, ++file_counter);
+        // Use thread-safe localtime_r
+        if (localtime_r(&ts.tv_sec, &tm_info)) {
+            snprintf(buffer, buffer_size, "%s/eulernav_log_%04d%02d%02d_%02d%02d%02d.bin",
+                Config::LOG_DIR_PATH,
+                tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
+                tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
+            return; // Exit after successful generation
+        }
     }
+
+    // Fallback to sequential numbering if time functions fail
+    static uint32_t file_counter = 0;
+    snprintf(buffer, buffer_size, "%s/eulernav_log_%06" PRIu32 ".bin",
+        Config::LOG_DIR_PATH, ++file_counter);
 }
 
 bool EulerNavDriver::createLogFile()
@@ -327,11 +330,14 @@ bool EulerNavDriver::createLogFile()
     return true;
 }
 
+// ...existing code...
 void EulerNavDriver::writeDataToFile()
 {
     if (_log_fd < 0) {
         return;
     }
+
+    size_t total_written_this_call = 0; // FIX 1: Track bytes written only in this function call.
 
     // Write data in chunks to avoid blocking
     while (_data_buffer.space_used() >= Config::FILE_WRITE_CHUNK_SIZE) {
@@ -348,11 +354,14 @@ void EulerNavDriver::writeDataToFile()
                 if (bytes_written > 0) {
                     _statistics._total_bytes_written += bytes_written;
                     offset += bytes_written;
+                    total_written_this_call += bytes_written; // FIX 1: Accumulate bytes for this call.
                 } else if (bytes_written == 0 || (bytes_written < 0 && errno != EINTR)) {
                     // Real error occurred
                     _statistics._write_errors++;
-                    PX4_WARN("File write error: %s", strerror(errno));
-                    return; // Exit to allow reinitialization
+                    PX4_WARN("File write error: %s. Closing file to force recovery.", strerror(errno));
+                    close(_log_fd);      // FIX 2: Close the invalid file descriptor.
+                    _log_fd = -1;        // FIX 2: Invalidate the handle to trigger re-initialization in run().
+                    return;
                 }
                 // If EINTR, just retry
             }
@@ -375,9 +384,13 @@ void EulerNavDriver::writeDataToFile()
                     if (bytes_written > 0) {
                         _statistics._total_bytes_written += bytes_written;
                         offset += bytes_written;
+                        total_written_this_call += bytes_written; // FIX 1: Accumulate bytes for this call.
                     } else if (bytes_written == 0 || (bytes_written < 0 && errno != EINTR)) {
                         _statistics._write_errors++;
-                        return; // Exit to allow reinitialization
+                        PX4_WARN("File write error: %s. Closing file to force recovery.", strerror(errno));
+                        close(_log_fd);      // FIX 2: Close the invalid file descriptor.
+                        _log_fd = -1;        // FIX 2: Invalidate the handle to trigger re-initialization in run().
+                        return;
                     }
                 }
             }
@@ -387,9 +400,10 @@ void EulerNavDriver::writeDataToFile()
     // Periodically sync to ensure data is physically written
     // Only sync every ~1MB to avoid excessive I/O
     static uint32_t bytes_since_sync = 0;
-    bytes_since_sync += _statistics._total_bytes_written;
+    bytes_since_sync += total_written_this_call; // FIX 1: Use the locally tracked count.
     if (bytes_since_sync > 1048576) { // 1MB
         fsync(_log_fd);
         bytes_since_sync = 0;
     }
 }
+

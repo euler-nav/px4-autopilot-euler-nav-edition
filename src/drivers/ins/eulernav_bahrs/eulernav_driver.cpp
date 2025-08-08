@@ -1,497 +1,363 @@
 #include "eulernav_driver.h"
 #include <px4_platform_common/getopt.h>
-#include <drivers/drv_sensor.h>
-#include <matrix/Quaternion.hpp>
-#include <matrix/Euler.hpp>
-#include <atmosphere/atmosphere.h>
+#include <errno.h>
+#include <string.h>
+#include <inttypes.h>
 
-EulerNavDriver::EulerNavDriver(const char* device_name)
-	: ModuleParams{nullptr}
-	, _serial_port{device_name, 115200, ByteSize::EightBits, Parity::None, StopBits::One, FlowControl::Disabled}
-	, _data_buffer{}
-	, _px4_accel{DRV_INS_DEVTYPE_BAHRS}
-	, _px4_gyro{DRV_INS_DEVTYPE_BAHRS}
-	, _attitude_pub{ORB_ID(external_ins_attitude)}
-	, _barometer_pub{ORB_ID(sensor_baro)}
+EulerNavDriver::EulerNavDriver(const char* device_name, uint32_t baud_rate)
+    : ModuleParams{nullptr}
+    , _serial_port{device_name, baud_rate, ByteSize::EightBits, Parity::None, StopBits::One, FlowControl::Disabled}
+    , _data_buffer{}
+    , _baud_rate{baud_rate}
 {
-	initialize();
+    // Store device name for logging
+    strncpy(_device_name, device_name, sizeof(_device_name) - 1);
+    _device_name[sizeof(_device_name) - 1] = '\0';
+
+    initialize();
 }
 
 EulerNavDriver::~EulerNavDriver()
 {
-	deinitialize();
+    deinitialize();
 }
 
 int EulerNavDriver::task_spawn(int argc, char *argv[])
 {
-	int task_id = px4_task_spawn_cmd("bahrs", SCHED_DEFAULT, SCHED_PRIORITY_FAST_DRIVER,
-					 Config::TASK_STACK_SIZE, (px4_main_t)&run_trampoline, argv);
+    int task_id = px4_task_spawn_cmd("eulernav_log", SCHED_DEFAULT, SCHED_PRIORITY_SLOW_DRIVER,
+                     Config::TASK_STACK_SIZE, (px4_main_t)&run_trampoline, argv);
 
-	if (task_id < 0)
-	{
-		_task_id = -1;
-		PX4_ERR("Failed to spawn task.");
-	}
-	else
-	{
-		_task_id = task_id;
-	}
+    if (task_id < 0)
+    {
+        _task_id = -1;
+        PX4_ERR("Failed to spawn task.");
+    }
+    else
+    {
+        _task_id = task_id;
+    }
 
-	return (_task_id < 0) ? 1 : 0;
+    return (_task_id < 0) ? 1 : 0;
 }
 
 EulerNavDriver* EulerNavDriver::instantiate(int argc, char *argv[])
 {
-	int option_index = 1;
-	const char* option_arg{nullptr};
-	const char* device_name{nullptr};
+    int option_index = 1;
+    const char* option_arg{nullptr};
+    const char* device_name{nullptr};
+    uint32_t baud_rate{115200};
 
-	while (true)
-	{
-		int option{px4_getopt(argc, argv, "d:", &option_index, &option_arg)};
+    while (true)
+    {
+        int option{px4_getopt(argc, argv, "d:b:", &option_index, &option_arg)};
 
-		if (EOF == option)
-		{
-			break;
-		}
+        if (EOF == option)
+        {
+            break;
+        }
 
-		switch (option)
-		{
-		case 'd':
-			device_name = option_arg;
-			break;
-		default:
-			break;
-		}
-	}
+        switch (option)
+        {
+        case 'd':
+            device_name = option_arg;
+            break;
+        case 'b':
+            baud_rate = static_cast<uint32_t>(atoi(option_arg));
+            if (baud_rate < 9600 || baud_rate > 921600) {
+                PX4_WARN("Invalid baud rate %" PRIu32 ", using default 115200", baud_rate);
+                baud_rate = 115200;
+            }
+            break;
+        default:
+            break;
+        }
+    }
 
-	return new EulerNavDriver(device_name);
+    if (!device_name) {
+        PX4_ERR("Device name is required");
+        return nullptr;
+    }
+
+    return new EulerNavDriver(device_name, baud_rate);
 }
 
 int EulerNavDriver::custom_command(int argc, char *argv[])
 {
-	return print_usage("unrecognized command");
+    return print_usage("unrecognized command");
 }
 
 int EulerNavDriver::print_usage(const char *reason)
 {
-	if (reason) {
-		PX4_WARN("%s\n", reason);
-	}
+    if (reason) {
+        PX4_WARN("%s\n", reason);
+    }
 
-	PRINT_MODULE_DESCRIPTION(
-		R"DESCR_STR(
+    PRINT_MODULE_DESCRIPTION(
+        R"DESCR_STR(
 ### Description
 
-Serial bus driver for the EULER-NAV Baro-Inertial AHRS.
+Serial data logger for the EULER-NAV BAHRS device.
+Logs raw serial data to binary files on SD card.
 
 ### Examples
 
-Attempt to start driver on a specified serial device.
+Start logger on specified serial device with default baud rate (115200)
 $ eulernav_bahrs start -d /dev/ttyS1
-Stop driver
+
+Start logger with custom baud rate
+$ eulernav_bahrs start -d /dev/ttyS1 -b 921600
+
+Stop logger
 $ eulernav_bahrs stop
 )DESCR_STR");
 
-	PRINT_MODULE_USAGE_NAME("eulernav_bahrs", "driver");
-	PRINT_MODULE_USAGE_SUBCATEGORY("ins");
-	PRINT_MODULE_USAGE_COMMAND_DESCR("start", "Start driver");
-	PRINT_MODULE_USAGE_PARAM_STRING('d', nullptr, nullptr, "Serial device", false);
-	PRINT_MODULE_USAGE_COMMAND_DESCR("status", "Print driver status");
-	PRINT_MODULE_USAGE_COMMAND_DESCR("stop", "Stop driver");
+    PRINT_MODULE_USAGE_NAME("eulernav_bahrs", "driver");
+    PRINT_MODULE_USAGE_SUBCATEGORY("ins");
+    PRINT_MODULE_USAGE_COMMAND_DESCR("start", "Start data logger");
+    PRINT_MODULE_USAGE_PARAM_STRING('d', nullptr, nullptr, "Serial device", true);
+    PRINT_MODULE_USAGE_PARAM_INT('b', 115200, 9600, 921600, "Baud rate", false);
+    PRINT_MODULE_USAGE_COMMAND_DESCR("status", "Print logger status");
+    PRINT_MODULE_USAGE_COMMAND_DESCR("stop", "Stop data logger");
 
-	return PX4_OK;
+    return PX4_OK;
 }
 
 int EulerNavDriver::print_status()
 {
-	if (_is_initialized)
-	{
-		PX4_INFO("Elapsed time: %llu [us].\n", hrt_elapsed_time(&_statistics._start_time));
-		PX4_INFO("Total bytes received: %lu.\n", _statistics._total_bytes_received);
-		PX4_INFO("Inertial messages received: %lu. Navigation messages received: %lu.\n",
-			_statistics._inertial_message_counter, _statistics._navigation_message_counter);
-		PX4_INFO("Failed CRC count: %lu.\n", _statistics._crc_failures);
+    if (_is_initialized)
+    {
+        PX4_INFO("EULER-NAV Data Logger Status:");
+        PX4_INFO("Elapsed time: %llu [us]", hrt_elapsed_time(&_statistics._start_time));
+        PX4_INFO("Baud rate: %" PRIu32, _baud_rate);
+        PX4_INFO("Log file: %s", _statistics._log_filename);
+        PX4_INFO("Total bytes received: %" PRIu32, _statistics._total_bytes_received);
+        PX4_INFO("Total bytes written: %" PRIu32, _statistics._total_bytes_written);
+        PX4_INFO("Write errors: %" PRIu32, _statistics._write_errors);
+        PX4_INFO("Buffer usage: %zu/%zu bytes", _data_buffer.space_used(), _data_buffer.space_available() + _data_buffer.space_used());
+    }
+    else
+    {
+        PX4_INFO("Logger is not initialized or failed to start");
+    }
 
-	}
-	else
-	{
-		PX4_INFO("Initialization failed. The driver is not running.\n");
-	}
-
-	return PX4_OK;
+    return PX4_OK;
 }
 
 void EulerNavDriver::run()
 {
-	_statistics._start_time = hrt_absolute_time();
+    _statistics._start_time = hrt_absolute_time();
 
-	while(false == should_exit())
-	{
-		if (_is_initialized)
-		{
-			const auto bytes_read{_serial_port.readAtLeast(_serial_read_buffer, sizeof(_serial_read_buffer),
-								       Config::MIN_BYTES_TO_READ, Config::SERIAL_READ_TIMEOUT_US)};
+    while (!should_exit())
+    {
+        if (_is_initialized && _log_fd >= 0)
+        {
+            // Read data from serial port
+            const auto bytes_read{_serial_port.readAtLeast(_serial_read_buffer, sizeof(_serial_read_buffer),
+                                       Config::MIN_BYTES_TO_READ, Config::SERIAL_READ_TIMEOUT_US)};
 
-			_statistics._total_bytes_received += bytes_read;
+            if (bytes_read > 0)
+            {
+                _statistics._total_bytes_received += bytes_read;
 
-			if (bytes_read > 0)
-			{
-				if (false == _data_buffer.push_back(_serial_read_buffer, bytes_read))
-				{
-					PX4_ERR("No space in data buffer");
-				}
-			}
+                // Push to ring buffer
+                if (!_data_buffer.push_back(_serial_read_buffer, bytes_read))
+                {
+                    PX4_WARN("Ring buffer overflow, data lost");
+                }
 
-			processDataBuffer();
-		}
-		else
-		{
-			deinitialize();
-			px4_usleep(1000000);
-			initialize();
-		}
-	}
+                // Write data to file
+                writeDataToFile();
+            }
+        }
+        else
+        {
+            // Re-initialize if something failed
+            deinitialize();
+            px4_usleep(1000000); // Wait 1 second before retry
+            initialize();
+        }
+    }
 }
 
 void EulerNavDriver::initialize()
 {
-	if (false == _is_initialized)
-	{
-		_serial_port.open();
+    if (_is_initialized) {
+        return;
+    }
 
-		if (_serial_port.isOpen())
-		{
-			PX4_INFO("Serial port opened successfully.");
-			_is_initialized = true;
-		}
-		else
-		{
-			PX4_ERR("Failed to open serial port");
-		}
+    // Create log directory
+    if (!createDirectory(Config::LOG_DIR_PATH)) {
+        PX4_ERR("Failed to create log directory");
+        return;
+    }
 
-		if (_is_initialized)
-		{
-			if (false == _data_buffer.allocate(Config::DATA_BUFFER_SIZE))
-			{
-				PX4_ERR("Failed to allocate data buffer");
-				_is_initialized = false;
-			}
-		}
+    // Open serial port
+    _serial_port.open();
+    if (!_serial_port.isOpen()) {
+        PX4_ERR("Failed to open serial port");
+        return;
+    }
 
-		if (false == _is_initialized)
-		{
-			deinitialize();
-		}
-		else
-		{
-			_attitude_pub.advertise();
-			_barometer_pub.advertise();
-		}
+    // Allocate ring buffer
+    if (!_data_buffer.allocate(Config::DATA_BUFFER_SIZE)) {
+        PX4_ERR("Failed to allocate data buffer");
+        _serial_port.close();
+        return;
+    }
 
-	}
+    // Create log file
+    if (!createLogFile()) {
+        PX4_ERR("Failed to create log file");
+        _data_buffer.deallocate();
+        _serial_port.close();
+        return;
+    }
+
+    _is_initialized = true;
+    PX4_INFO("EULER-NAV logger initialized successfully");
+    PX4_INFO("Serial port: %s at %" PRIu32 " baud", _device_name, _baud_rate);
+    PX4_INFO("Log file: %s", _statistics._log_filename);
 }
 
 void EulerNavDriver::deinitialize()
 {
-	if (_serial_port.isOpen())
-	{
-		_serial_port.close();
-	}
-
-	_data_buffer.deallocate();
-	_attitude_pub.unadvertise();
-	_barometer_pub.unadvertise();
-	_is_initialized = false;
-}
-
-void EulerNavDriver::processDataBuffer()
-{
-	static_assert(Config::MIN_MESSAGE_LENGTH >= (sizeof(CSerialProtocol::SMessageHeader) + sizeof(CSerialProtocol::CrcType_t)));
-	using EMessageIds = CSerialProtocol::EMessageIds;
-
-	while (_data_buffer.space_used() >= Config::MIN_MESSAGE_LENGTH)
-	{
-		if (false == _next_message_info._is_detected)
-		{
-			_next_message_info._is_detected = findNextMessageHeader(_data_buffer);
-
-			if (_next_message_info._is_detected)
-			{
-				if (false == retrieveProtocolVersionAndMessageType(_data_buffer, _next_message_info._protocol_version, _next_message_info._message_code))
-				{
-					_next_message_info._is_detected = false;
-				}
-			}
-		}
-
-		if (_next_message_info._is_detected)
-		{
-			static_assert(sizeof(CSerialProtocol::SMessageHeader) < Config::MIN_MESSAGE_LENGTH);
-
-			const EMessageIds message_id{static_cast<EMessageIds>(_next_message_info._message_code)};
-			const int32_t message_length{getMessageLength(message_id)};
-
-			if ((message_length < 0) || (message_length < Config::MIN_MESSAGE_LENGTH) ||
-			    (message_length > static_cast<int32_t>(sizeof(_message_storage))) || ((message_length % sizeof(uint32_t)) != 0U))
-			{
-				// The message is unknown, not supported, or does not fit into the temporary storage.
-				_next_message_info._is_detected = false;
-			}
-
-			if (_next_message_info._is_detected)
-			{
-				const int32_t bytes_to_retrieve{message_length - static_cast<int32_t>(sizeof(CSerialProtocol::SMessageHeader))};
-
-				if (static_cast<int32_t>(_data_buffer.space_used()) < bytes_to_retrieve)
-				{
-					// Do nothing and wait for more bytes to arrive.
-					break;
-				}
-				else
-				{
-					// Get message from the data buffer
-					uint8_t* bytes{reinterpret_cast<uint8_t*>(_message_storage)};
-
-					bytes[0] = CSerialProtocol::uMarker1_;
-					bytes[1] = CSerialProtocol::uMarker2_;
-					bytes[2] = reinterpret_cast<uint8_t*>(&_next_message_info._protocol_version)[0];
-					bytes[3] = reinterpret_cast<uint8_t*>(&_next_message_info._protocol_version)[1];
-					bytes[4] = _next_message_info._message_code;
-
-					if (static_cast<size_t>(bytes_to_retrieve) == _data_buffer.pop_front(bytes + sizeof(CSerialProtocol::SMessageHeader), bytes_to_retrieve))
-					{
-						const uint32_t message_length_in_words{message_length / sizeof(uint32_t)};
-						const uint32_t actual_crc{crc32(_message_storage, message_length_in_words - 1)};
-						const uint32_t expected_crc = _message_storage[message_length_in_words - 1];
-
-						if (expected_crc != actual_crc)
-						{
-							++_statistics._crc_failures;
-						}
-						else
-						{
-							decodeMessageAndPublishData(bytes, message_id);
-						}
-					}
-
-					_next_message_info._is_detected = false;
-				}
-			}
-
-		}
-	}
-
-}
-
-bool EulerNavDriver::findNextMessageHeader(Ringbuffer& buffer)
-{
-	bool result{false};
-
-	while (buffer.space_used() >= sizeof(CSerialProtocol::SMessageHeader))
-	{
-		uint8_t sync_byte{0U};
-
-		if (1 == buffer.pop_front(&sync_byte, 1))
-		{
-			if (CSerialProtocol::uMarker1_ == sync_byte)
-			{
-				sync_byte = 0U;
-
-				if (1 == buffer.pop_front(&sync_byte, 1))
-				{
-					if (CSerialProtocol::uMarker2_ == sync_byte)
-					{
-						result = true;
-						break;
-					}
-				}
-
-			}
-		}
-	}
-
-	return result;
-}
-
-bool EulerNavDriver::retrieveProtocolVersionAndMessageType(Ringbuffer& buffer, uint16_t& protocol_ver, uint8_t& message_code)
-{
-	bool status{true};
-	auto bytes_to_pop{sizeof(protocol_ver)};
-
-	// Note: BAHRS uses little endian
-	if (bytes_to_pop != buffer.pop_front(reinterpret_cast<uint8_t*>(&protocol_ver), bytes_to_pop))
-	{
-		status = false;
-	}
-
-	if (status)
-	{
-		bytes_to_pop = 1;
-
-		if (bytes_to_pop != buffer.pop_front(&message_code, bytes_to_pop))
-		{
-			status = false;
-		}
-	}
-
-	return status;
-}
-
-void EulerNavDriver::decodeMessageAndPublishData(const uint8_t* data, CSerialProtocol::EMessageIds messsage_id)
-{
-	switch (messsage_id)
-	{
-	case CSerialProtocol::EMessageIds::eInertialData:
-		handleInertialDataMessage(data);
-		break;
-	case CSerialProtocol::EMessageIds::eNavigationData:
-		handleNavigationDataMessage(data);
-		break;
-	default:
-		break;
-	}
-}
-
-void EulerNavDriver::handleInertialDataMessage(const uint8_t* data)
-{
-	const CSerialProtocol::SInertialDataMessage* imu_msg{reinterpret_cast<const CSerialProtocol::SInertialDataMessage*>(data)};
-
-	if (nullptr != imu_msg)
-	{
-		const auto& imu_data{imu_msg->oInertialData_};
-		const bool accel_valid{((imu_data.uValidity_ & BIT_VALID_SPECIFIC_FORCE_X) > 0) &&
-					((imu_data.uValidity_ & BIT_VALID_SPECIFIC_FORCE_Y) > 0) &&
-					((imu_data.uValidity_ & BIT_VALID_SPECIFIC_FORCE_Z) > 0)};
-
-		const bool gyro_valid{((imu_data.uValidity_ & BIT_VALID_ANGULAR_RATE_X) > 0) &&
-					((imu_data.uValidity_ & BIT_VALID_ANGULAR_RATE_Y) > 0) &&
-					((imu_data.uValidity_ & BIT_VALID_ANGULAR_RATE_Z) > 0)};
-
-		const auto time = hrt_absolute_time();
-
-		if (accel_valid)
-		{
-			const float accel_x{CSerialProtocol::skfSpecificForceScale_ * static_cast<float>(imu_data.iSpecificForceX_)};
-			const float accel_y{CSerialProtocol::skfSpecificForceScale_ * static_cast<float>(imu_data.iSpecificForceY_)};
-			const float accel_z{CSerialProtocol::skfSpecificForceScale_ * static_cast<float>(imu_data.iSpecificForceZ_)};
-
-			_px4_accel.update(time, accel_x, accel_y, accel_z);
-		}
-
-		if (gyro_valid)
-		{
-			const float gyro_x{CSerialProtocol::skfAngularRateScale_ * static_cast<float>(imu_data.iAngularRateX_)};
-			const float gyro_y{CSerialProtocol::skfAngularRateScale_ * static_cast<float>(imu_data.iAngularRateY_)};
-			const float gyro_z{CSerialProtocol::skfAngularRateScale_ * static_cast<float>(imu_data.iAngularRateZ_)};
-
-			_px4_gyro.update(time, gyro_x, gyro_y, gyro_z);
-		}
-
-		++_statistics._inertial_message_counter;
-	}
-}
-
-void EulerNavDriver::handleNavigationDataMessage(const uint8_t* data)
-{
-	const CSerialProtocol::SNavigationDataMessage* nav_msg{reinterpret_cast<const CSerialProtocol::SNavigationDataMessage*>(data)};
-
-	if (nullptr != nav_msg)
-	{
-		const auto& nav_data{nav_msg->oNavigationData_};
-		const bool roll_valid{(nav_data.uValidity_ & BIT_VALID_ROLL) > 0};
-		const bool pitch_valid{(nav_data.uValidity_ & BIT_VALID_PITCH) > 0};
-		const bool yaw_valid{(nav_data.uValidity_ & BIT_VALID_MAGNETIC_HEADING) > 0};
-		const auto time{hrt_absolute_time()};
-
-		if (roll_valid && pitch_valid && yaw_valid)
-		{
-			const float roll{CSerialProtocol::skfAngleScale_ * static_cast<float>(nav_data.iRoll_)};
-			const float pitch{CSerialProtocol::skfAngleScale_ * static_cast<float>(nav_data.iPitch_)};
-			const float yaw{CSerialProtocol::skfAngleScale_ * static_cast<float>(nav_data.uMagneticHeading_)};
-
-			const matrix::Quaternionf quat{matrix::Eulerf{roll, pitch, yaw}};
-			VehicleAttitude attitude{};
-
-			attitude.q[0] = quat(0);
-			attitude.q[1] = quat(1);
-			attitude.q[2] = quat(2);
-			attitude.q[3] = quat(3);
-
-			attitude.timestamp = time;
-			attitude.timestamp_sample = time;
-
-			_attitude_pub.publish(attitude);
-		}
-
-		const bool height_valid{(nav_data.uValidity_ & BIT_VALID_HEIGHT) > 0};
-
-		if (height_valid)
-		{
-			const float height{(CSerialProtocol::skfHeightScale_ * static_cast<float>(nav_data.uPressureHeight_)) - CSerialProtocol::skfHeighOffset_};
-			PressureData pressure{};
-
-			pressure.pressure = atmosphere::getPressureFromAltitude(height);
-
-			// EULER-NAV Baro-Inertial AHRS provides height estimate from a Kalman filter. It has got low noise and resolution
-			// of about 17 cm. It causes PX4 autopilot to mistakenly report that pressure signal is stale. In order to prevent
-			// the false alarms we add a small noise to the received height data.
-			if (_statistics._navigation_message_counter % 2U == 0)
-			{
-				pressure.pressure += 0.01F;
-			}
-
-			pressure.timestamp = time;
-			pressure.timestamp_sample = time;
-			pressure.device_id = DRV_INS_DEVTYPE_BAHRS;
-			pressure.temperature = NAN;
-
-			_barometer_pub.publish(pressure);
-		}
-
-		++_statistics._navigation_message_counter;
-	}
-}
-
-int32_t EulerNavDriver::getMessageLength(CSerialProtocol::EMessageIds messsage_id)
-{
-	int message_length{-1};
-
-	switch (messsage_id)
-	{
-	case CSerialProtocol::EMessageIds::eInertialData:
-		message_length = sizeof(CSerialProtocol::SInertialDataMessage);
-		break;
-	case CSerialProtocol::EMessageIds::eNavigationData:
-		message_length = sizeof(CSerialProtocol::SNavigationDataMessage);
-		break;
-	default:
-		break;
-	}
-
-	return message_length;
-}
-
-uint32_t EulerNavDriver::crc32(const uint32_t* buffer, size_t length)
-{
-  uint32_t crc = 0xFFFFFFFF;
-
-  for (size_t i = 0; i < length; ++i)
-  {
-    crc = crc ^ buffer[i];
-
-    for (uint8_t j = 0; j < 32; j++)
-    {
-      if (crc & 0x80000000)
-      {
-        crc = (crc << 1) ^ 0x04C11DB7;
-      }
-      else
-      {
-        crc = (crc << 1);
-      }
+    if (_log_fd >= 0) {
+        // Flush remaining data
+        writeDataToFile();
+        close(_log_fd);
+        _log_fd = -1;
     }
-  }
 
-  return crc;
+    if (_serial_port.isOpen()) {
+        _serial_port.close();
+    }
+
+    _data_buffer.deallocate();
+    _is_initialized = false;
+}
+
+bool EulerNavDriver::createDirectory(const char* path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return S_ISDIR(st.st_mode);
+    }
+
+    // Try to create the directory
+    if (mkdir(path, 0755) == 0) {
+        return true;
+    }
+
+    // If mkdir failed, check if parent directory exists
+    if (errno == ENOENT) {
+        // Try to create parent directory first
+        char parent_path[128];
+        strncpy(parent_path, path, sizeof(parent_path) - 1);
+        parent_path[sizeof(parent_path) - 1] = '\0';
+
+        char* last_slash = strrchr(parent_path, '/');
+        if (last_slash && last_slash != parent_path) {
+            *last_slash = '\0';
+            if (createDirectory(parent_path)) {
+                return mkdir(path, 0755) == 0;
+            }
+        }
+    }
+
+    return false;
+}
+
+void EulerNavDriver::generateFilename(char* buffer, size_t buffer_size)
+{
+    struct timespec ts;
+    struct tm *tm_info;
+
+    // Try to get current time
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.tv_sec > 1000000000) {
+        tm_info = localtime(&ts.tv_sec);
+        snprintf(buffer, buffer_size, "%s/eulernav_log_%04d%02d%02d_%02d%02d%02d.bin",
+            Config::LOG_DIR_PATH,
+            tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
+            tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+    } else {
+        // Fallback to sequential numbering
+        static uint32_t file_counter = 0;
+        snprintf(buffer, buffer_size, "%s/eulernav_log_%06" PRIu32 ".bin",
+            Config::LOG_DIR_PATH, ++file_counter);
+    }
+}
+
+bool EulerNavDriver::createLogFile()
+{
+    char filename[128];
+    struct stat st;
+
+    // Generate filename and ensure it's unique
+    for (int attempts = 0; attempts < 1000; attempts++) {
+        generateFilename(filename, sizeof(filename));
+
+        if (stat(filename, &st) != 0) {
+            // File doesn't exist, we can use this name
+            break;
+        }
+
+        // File exists, wait a bit and try again
+        px4_usleep(1000);
+    }
+
+    // Create and open the file
+    _log_fd = open(filename, O_CREAT | O_WRONLY | O_EXCL, 0644);
+
+    if (_log_fd < 0) {
+        PX4_ERR("Failed to create log file %s: %s", filename, strerror(errno));
+        return false;
+    }
+
+    // Store filename for status reporting
+    strncpy(_statistics._log_filename, filename, sizeof(_statistics._log_filename) - 1);
+    _statistics._log_filename[sizeof(_statistics._log_filename) - 1] = '\0';
+
+    return true;
+}
+
+void EulerNavDriver::writeDataToFile()
+{
+    if (_log_fd < 0) {
+        return;
+    }
+
+    // Write data in chunks to avoid blocking
+    while (_data_buffer.space_used() >= Config::FILE_WRITE_CHUNK_SIZE) {
+        size_t bytes_to_write = _data_buffer.pop_front(_file_write_buffer, Config::FILE_WRITE_CHUNK_SIZE);
+
+        if (bytes_to_write > 0) {
+            ssize_t bytes_written = write(_log_fd, _file_write_buffer, bytes_to_write);
+
+            if (bytes_written > 0) {
+                _statistics._total_bytes_written += bytes_written;
+            } else {
+                _statistics._write_errors++;
+                PX4_WARN("File write error: %s", strerror(errno));
+                break;
+            }
+        }
+    }
+
+    // Write remaining smaller chunks
+    if (_data_buffer.space_used() > 0) {
+        size_t remaining = _data_buffer.space_used();
+        if (remaining <= Config::FILE_WRITE_CHUNK_SIZE) {
+            size_t bytes_to_write = _data_buffer.pop_front(_file_write_buffer, remaining);
+
+            if (bytes_to_write > 0) {
+                ssize_t bytes_written = write(_log_fd, _file_write_buffer, bytes_to_write);
+
+                if (bytes_written > 0) {
+                    _statistics._total_bytes_written += bytes_written;
+                } else {
+                    _statistics._write_errors++;
+                }
+            }
+        }
+    }
 }

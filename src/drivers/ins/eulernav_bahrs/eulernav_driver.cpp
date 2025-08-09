@@ -184,6 +184,7 @@ void EulerNavDriver::run()
                                          nullptr);
     if (_reader_task_id < 0) {
         PX4_ERR("Failed to spawn reader task");
+        _is_initialized = false;  // Mark as failed
         deinitialize();
         return;
     }
@@ -197,7 +198,12 @@ void EulerNavDriver::run()
                                          nullptr);
     if (_writer_task_id < 0) {
         PX4_ERR("Failed to spawn writer task");
-        // Continue running reader until stop is requested
+        // Kill reader task and exit
+        px4_task_delete(_reader_task_id);
+        _reader_task_id = -1;
+        _is_initialized = false;
+        deinitialize();
+        return;
     }
 
     // Monitor until stop requested
@@ -207,8 +213,14 @@ void EulerNavDriver::run()
 
     // Give workers time to exit
     const hrt_abstime t0 = hrt_absolute_time();
-    while (((_reader_task_id > 0) || (_writer_task_id > 0)) && (hrt_absolute_time() - t0 < 2 * 1000 * 1000)) {
-        px4_usleep(50000);
+    while ((hrt_absolute_time() - t0 < 2 * 1000 * 1000)) {
+        bool reader_alive = (_reader_task_id > 0);  // Add task status check if available
+        bool writer_alive = (_writer_task_id > 0);
+
+        if (!reader_alive && !writer_alive) {
+            break;
+        }
+	px4_usleep(50000);
     }
 
     deinitialize();
@@ -276,7 +288,6 @@ void EulerNavDriver::readerTask()
     }
 
     PX4_INFO("Reader task exiting");
-    _reader_task_id = -1;
 }
 
 void EulerNavDriver::writerTask()
@@ -333,7 +344,6 @@ void EulerNavDriver::writerTask()
     }
 
     PX4_INFO("Writer task exiting");
-    _writer_task_id = -1;
 }
 
 bool EulerNavDriver::initialize()
@@ -460,9 +470,9 @@ void EulerNavDriver::queueFilledBuffer(DataBuffer* buffer)
     }
 
     const uint8_t idx = static_cast<uint8_t>(buffer - _buffer_pool);
-    const uint8_t next_tail = static_cast<uint8_t>((_filled_tail + 1) % NUM_BUFFERS);
+    const uint8_t current_tail = _filled_tail;
+    const uint8_t next_tail = static_cast<uint8_t>((current_tail + 1) % NUM_BUFFERS);
 
-    // Queue full -> drop and mark overflow
     if (next_tail == _filled_head) {
         _statistics._buffer_overflows++;
         PX4_WARN("Filled queue overflow, dropping buffer");
@@ -470,8 +480,8 @@ void EulerNavDriver::queueFilledBuffer(DataBuffer* buffer)
         return;
     }
 
-    _filled_queue[_filled_tail] = idx;
-    _filled_tail = next_tail;
+    _filled_queue[current_tail] = idx;
+    _filled_tail = next_tail;  // Single atomic write
 
     px4_sem_post(&_filled_buffers_sem);
 }

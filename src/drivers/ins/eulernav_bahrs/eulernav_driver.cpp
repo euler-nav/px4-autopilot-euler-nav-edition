@@ -267,6 +267,16 @@ void EulerNavDriver::readerTask()
     PX4_INFO("Reader task started");
     _reader_running = true;
 
+   _serial_port.open();
+
+   if (!_serial_port.isOpen()) {
+       PX4_ERR("Reader: Failed to open serial port %s", _device_name);
+       _reader_running = false;
+       return;
+   }
+
+   PX4_INFO("Reader: Serial port opened successfully");
+
     while (!exitRequested()) {
         // 1. Get a buffer to fill. This will block if none are free.
         DataBuffer *buffer = getAvailableBuffer();
@@ -281,8 +291,7 @@ void EulerNavDriver::readerTask()
         }
 
         // 2. Attempt to read from the serial port.
-        const auto bytes_read = _serial_port.readAtLeast(buffer->data, DataBuffer::BUFFER_SIZE, 12, 100000);
-	PX4_INFO("=== Read result: %d bytes ===", (int)bytes_read);
+        const auto bytes_read = _serial_port.readAtLeast(buffer->data, DataBuffer::BUFFER_SIZE, DataBuffer::BUFFER_SIZE, 100000);
 
         if (bytes_read > 0) {
             // 3a. If we got data, queue the buffer for the writer.
@@ -300,6 +309,11 @@ void EulerNavDriver::readerTask()
             px4_usleep(1000); // 1ms sleep
         }
     }
+
+   // Close serial port in the reader task
+   if (_serial_port.isOpen()) {
+       _serial_port.close();
+   }
 
     PX4_INFO("Reader task exiting");
     _reader_running = false;
@@ -380,16 +394,8 @@ bool EulerNavDriver::initialize()
         return false;
     }
 
-    _serial_port.open();
-
-    if (!_serial_port.isOpen()) {
-        PX4_ERR("Failed to open serial port");
-        return false;
-    }
-
     if (!createLogFile()) {
         PX4_ERR("Failed to create log file");
-        _serial_port.close();
         return false;
     }
 
@@ -406,10 +412,6 @@ void EulerNavDriver::deinitialize()
         fsync(_log_fd);
         close(_log_fd);
         _log_fd = -1;
-    }
-
-    if (_serial_port.isOpen()) {
-        _serial_port.close();
     }
 
     _is_initialized = false;

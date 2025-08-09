@@ -276,12 +276,13 @@ void EulerNavDriver::readerTask()
             // It implies the writer is stuck and not releasing buffers.
             _statistics._buffer_overflows++;
             // A small sleep is good to prevent spamming if we are in a bad state.
-            px4_usleep(100000); // 10ms
+            px4_usleep(100000);
             continue;
         }
 
         // 2. Attempt to read from the serial port.
-        const auto bytes_read = _serial_port.read(buffer->data, DataBuffer::BUFFER_SIZE);
+        const auto bytes_read = _serial_port.readAtLeast(buffer->data, DataBuffer::BUFFER_SIZE, 12, 100000);
+	PX4_INFO("=== Read result: %d bytes ===", (int)bytes_read);
 
         if (bytes_read > 0) {
             // 3a. If we got data, queue the buffer for the writer.

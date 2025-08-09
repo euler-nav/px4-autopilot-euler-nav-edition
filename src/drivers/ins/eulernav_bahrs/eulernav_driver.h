@@ -44,21 +44,21 @@ private:
     struct Statistics
     {
         uint32_t _total_bytes_received{0U}; ///< Total number of received bytes
-        uint32_t _total_bytes_written{0U}; ///< Total number of bytes written to file
-        uint32_t _write_errors{0U}; ///< File write error counter
-        hrt_abstime _start_time{0U}; ///< Driver start time, [us]
-        char _log_filename[64]{0}; ///< Current log file name
+        uint32_t _total_bytes_written{0U};  ///< Total number of bytes written to file
+        uint32_t _write_errors{0U};         ///< File write error counter
+        hrt_abstime _start_time{0U};          ///< Driver start time, [us]
+        char _log_filename[64]{0};          ///< Current log file name
     };
 
     /// @brief Configuration constants
     struct Config
     {
-        static constexpr uint32_t TASK_STACK_SIZE{3072}; ///< Driver task stack size (increased for file I/O)
-        static constexpr uint32_t SERIAL_READ_BUFFER_SIZE{1024}; ///< Buffer size for serial port read operations
-        static constexpr uint32_t MIN_BYTES_TO_READ{1}; ///< Minimum number of bytes to wait for when reading from a serial port
-        static constexpr uint32_t SERIAL_READ_TIMEOUT_US{10000}; ///< A timeout for serial port read operation
-        static constexpr uint32_t DATA_BUFFER_SIZE{16384}; ///< Size of ring buffer for storing RX data stream (increased for high baud rates)
-        static constexpr uint32_t FILE_WRITE_CHUNK_SIZE{1024}; ///< Size of chunks to write to file (increased for efficiency)
+        static constexpr uint32_t TASK_STACK_SIZE{3072};                ///< Driver task stack size (increased for file I/O)
+        static constexpr uint32_t SERIAL_READ_BUFFER_SIZE{1024};          ///< Buffer size for serial port read operations
+        static constexpr uint32_t MIN_BYTES_TO_READ{1};                   ///< Minimum number of bytes to wait for when reading from a serial port
+        static constexpr uint32_t SERIAL_READ_TIMEOUT_US{10000};          ///< A timeout for serial port read operation
+        static constexpr uint32_t DATA_BUFFER_SIZE{16384};                ///< Size of ring buffer for storing RX data stream (increased for high baud rates)
+        static constexpr uint32_t FILE_WRITE_CHUNK_SIZE{1024};            ///< Size of chunks to write to file (increased for efficiency)
         static constexpr const char* LOG_DIR_PATH{"/fs/microsd/log/eulernav"}; ///< Log directory path
     };
 
@@ -85,13 +85,13 @@ private:
     /// @param buffer_size Size of output buffer
     void generateFilename(char* buffer, size_t buffer_size);
 
-    device::Serial _serial_port; ///< Serial port object to read data from
-    Ringbuffer _data_buffer; ///< A buffer for RX data stream
-    uint8_t _serial_read_buffer[Config::SERIAL_READ_BUFFER_SIZE]; ///< A buffer for serial port read operation
-    uint8_t _file_write_buffer[Config::FILE_WRITE_CHUNK_SIZE]; ///< Buffer for file write operations
-    Statistics _statistics{}; ///< Driver performance indicators
-    bool _is_initialized{false}; ///< Initialization flag
-    int _log_fd{-1}; ///< Log file descriptor
-    uint32_t _baud_rate; ///< Serial port baud rate
-    char _device_name[64]; ///< Serial device name for logging
+    device::Serial _serial_port;                           ///< Serial port object to read data from
+    Ringbuffer _data_buffer;                               ///< A ring buffer for RX data stream
+    uint8_t _serial_read_buffer[Config::SERIAL_READ_BUFFER_SIZE]; ///< Buffer for serial port reads
+    uint8_t _file_write_buffer[Config::FILE_WRITE_CHUNK_SIZE];      ///< Buffer for file writes
+    Statistics _statistics{};                              ///< Driver performance indicators
+    bool _is_initialized{false};                           ///< Initialization flag
+    int _log_fd{-1};                                     ///< Log file descriptor
+    uint32_t _baud_rate;                                 ///< Serial port baud rate
+    char _device_name[64];                               ///< Serial device name for logging
 };

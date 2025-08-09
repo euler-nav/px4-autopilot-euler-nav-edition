@@ -192,7 +192,7 @@ void EulerNavDriver::run()
     // Spawn reader task (higher prio)
     _reader_task_id = px4_task_spawn_cmd("eulernav_reader",
                          SCHED_DEFAULT,
-                         SCHED_PRIORITY_DEFAULT + 5,
+                         SCHED_PRIORITY_DEFAULT + 1,
                          Config::TASK_STACK_SIZE,
                          (px4_main_t)&EulerNavDriver::readerTaskEntry,
                          nullptr);
@@ -268,48 +268,35 @@ void EulerNavDriver::readerTask()
     _reader_running = true;
 
     while (!exitRequested()) {
+        // 1. Get a buffer to fill. This will block if none are free.
         DataBuffer *buffer = getAvailableBuffer();
 
         if (!buffer) {
+            // This case happens if the getAvailableBuffer semaphore times out.
+            // It implies the writer is stuck and not releasing buffers.
             _statistics._buffer_overflows++;
-            PX4_WARN("No free buffers; data may be lost");
-            px4_usleep(1000);
+            // A small sleep is good to prevent spamming if we are in a bad state.
+            px4_usleep(100000); // 10ms
             continue;
         }
 
-        buffer->length = 0;
-        bool got_data = false;
+        // 2. Attempt to read from the serial port.
+        const auto bytes_read = _serial_port.read(buffer->data, DataBuffer::BUFFER_SIZE);
 
-        while (!exitRequested() && buffer->length < DataBuffer::BUFFER_SIZE) {
-            const auto bytes_read = _serial_port.readAtLeast(_serial_read_buffer,
-                          sizeof(_serial_read_buffer),
-                          Config::MIN_BYTES_TO_READ,
-                          Config::SERIAL_READ_TIMEOUT_US);
-
-            if (bytes_read > 0) {
-                const size_t bytes_to_copy = min_size(static_cast<size_t>(bytes_read),
-                                      DataBuffer::BUFFER_SIZE - buffer->length);
-                memcpy(buffer->data + buffer->length, _serial_read_buffer, bytes_to_copy);
-                buffer->length += bytes_to_copy;
-                _statistics._total_bytes_received += bytes_to_copy;
-                got_data = true;
-
-                if (bytes_to_copy < static_cast<size_t>(bytes_read)) {
-                    PX4_WARN("Buffer full, dropped %zu bytes", static_cast<size_t>(bytes_read) - bytes_to_copy);
-                    _statistics._buffer_overflows++;
-                    break;
-                }
-
-            } else if (got_data) {
-                break; // timeout with some data -> dispatch
-            }
-        }
-
-        if (got_data) {
+        if (bytes_read > 0) {
+            // 3a. If we got data, queue the buffer for the writer.
+            buffer->length = bytes_read;
+            _statistics._total_bytes_received += bytes_read;
             queueFilledBuffer(buffer);
 
         } else {
+            // 3b. If we got no data (timeout), release the buffer immediately
+            // so it can be used again.
             releaseBuffer(buffer);
+
+            // IMPORTANT: Add a small delay to prevent a tight busy-loop
+            // when no data is available. This yields CPU to other tasks.
+            px4_usleep(1000); // 1ms sleep
         }
     }
 

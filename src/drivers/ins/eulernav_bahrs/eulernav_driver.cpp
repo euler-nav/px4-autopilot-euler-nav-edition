@@ -1,28 +1,45 @@
 #include "eulernav_driver.h"
 #include <px4_platform_common/getopt.h>
+#include <px4_platform_common/tasks.h>
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
-#include <px4_platform_common/tasks.h>
-#include <algorithm> // add for std::min
+
+// Minimal helper: avoid <algorithm>
+static inline size_t min_size(size_t a, size_t b) { return (a < b) ? a : b; }
+
+static inline void make_abstime_us(struct timespec &abstime, uint32_t timeout_us)
+{
+    clock_gettime(CLOCK_REALTIME, &abstime);
+    uint64_t nsec = (uint64_t)abstime.tv_nsec + (uint64_t)timeout_us * 1000ULL;
+    abstime.tv_sec  += nsec / 1000000000ULL;
+    abstime.tv_nsec  = nsec % 1000000000ULL;
+}
 
 EulerNavDriver* EulerNavDriver::_instance = nullptr;
 
 EulerNavDriver::EulerNavDriver(const char* device_name, uint32_t baud_rate)
     : ModuleParams{nullptr}
-    , _serial_port{device_name, baud_rate, device::SerialConfig::ByteSize::EightBits,
-                   device::SerialConfig::Parity::None, device::SerialConfig::StopBits::One,
+    , _serial_port{device_name, baud_rate,
+                   device::SerialConfig::ByteSize::EightBits,
+                   device::SerialConfig::Parity::None,
+                   device::SerialConfig::StopBits::One,
                    device::SerialConfig::FlowControl::Disabled}
     , _baud_rate{baud_rate}
 {
-    // ...existing code...
-    _instance = this; // set global instance for worker entries
+    // Store device name for logging
+    strncpy(_device_name, device_name, sizeof(_device_name) - 1);
+    _device_name[sizeof(_device_name) - 1] = '\0';
+
+    // Set global instance for worker entries
+    _instance = this;
 
     // Initialize semaphores
     px4_sem_init(&_free_buffers_sem, 0, NUM_BUFFERS);
     px4_sem_init(&_filled_buffers_sem, 0, 0);
 
-    // Init buffer pool
+    // Init buffer pool and queue
     for (size_t i = 0; i < NUM_BUFFERS; i++) {
         _buffer_pool[i].in_use = false;
         _buffer_pool[i].length = 0;
@@ -31,14 +48,12 @@ EulerNavDriver::EulerNavDriver(const char* device_name, uint32_t baud_rate)
     _filled_head = 0;
     _filled_tail = 0;
 
-    initialize();
+    (void)initialize();
 }
 
 EulerNavDriver::~EulerNavDriver()
 {
     deinitialize();
-
-    // Destroy semaphores
     px4_sem_destroy(&_free_buffers_sem);
     px4_sem_destroy(&_filled_buffers_sem);
 }
@@ -54,30 +69,25 @@ int EulerNavDriver::task_spawn(int argc, char *argv[])
     } else {
         _task_id = task_id;
     }
-
     return (_task_id < 0) ? 1 : 0;
 }
 
 EulerNavDriver* EulerNavDriver::instantiate(int argc, char *argv[])
 {
-    int option_index = 1;
-    const char* option_arg{nullptr};
+    int myoptind = 1;
+    const char* myoptarg = nullptr;
+
     const char* device_name{nullptr};
     uint32_t baud_rate{115200};
 
-    while (true) {
-        int option = px4_getopt(argc, argv, "d:b:", &option_index, &option_arg);
-
-        if (EOF == option) {
-            break;
-        }
-
-        switch (option) {
+    int ch;
+    while ((ch = px4_getopt(argc, argv, "d:b:", &myoptind, &myoptarg)) != EOF) {
+        switch (ch) {
         case 'd':
-            device_name = option_arg;
+            device_name = myoptarg;
             break;
         case 'b':
-            baud_rate = static_cast<uint32_t>(atoi(option_arg));
+            baud_rate = static_cast<uint32_t>(atoi(myoptarg));
             if (baud_rate < 9600 || baud_rate > 921600) {
                 PX4_WARN("Invalid baud rate %" PRIu32 ", using default 115200", baud_rate);
                 baud_rate = 115200;
@@ -96,7 +106,7 @@ EulerNavDriver* EulerNavDriver::instantiate(int argc, char *argv[])
     return new EulerNavDriver(device_name, baud_rate);
 }
 
-int EulerNavDriver::custom_command(int argc, char *argv[])
+int EulerNavDriver::custom_command(int, char *[])
 {
     return print_usage("unrecognized command");
 }
@@ -104,35 +114,28 @@ int EulerNavDriver::custom_command(int argc, char *argv[])
 int EulerNavDriver::print_usage(const char *reason)
 {
     if (reason) {
-        PX4_WARN("%s\n", reason);
+        PX4_WARN("%s", reason);
     }
 
     PRINT_MODULE_DESCRIPTION(
         R"DESCR_STR(
 ### Description
-
-Serial data logger for the EULER-NAV BAHRS device.
-Logs raw serial data to binary files on SD card.
+Serial data logger for the EULER-NAV BAHRS device. Logs raw serial data to SD.
 
 ### Examples
-
-Start logger on specified serial device with default baud rate (115200)
-$ eulernav_bahrs start -d /dev/ttyS1
-
-Start logger with custom baud rate
-$ eulernav_bahrs start -d /dev/ttyS1 -b 921600
-
-Stop logger
-$ eulernav_bahrs stop
+eulernav_bahrs start -d /dev/ttyS1
+eulernav_bahrs start -d /dev/ttyS1 -b 921600
+eulernav_bahrs status
+eulernav_bahrs stop
 )DESCR_STR");
 
     PRINT_MODULE_USAGE_NAME("eulernav_bahrs", "driver");
     PRINT_MODULE_USAGE_SUBCATEGORY("ins");
-    PRINT_MODULE_USAGE_COMMAND_DESCR("start", "Start data logger");
+    PRINT_MODULE_USAGE_COMMAND("start");
     PRINT_MODULE_USAGE_PARAM_STRING('d', nullptr, nullptr, "Serial device", true);
     PRINT_MODULE_USAGE_PARAM_INT('b', 115200, 9600, 921600, "Baud rate", false);
-    PRINT_MODULE_USAGE_COMMAND_DESCR("status", "Print logger status");
-    PRINT_MODULE_USAGE_COMMAND_DESCR("stop", "Stop data logger");
+    PRINT_MODULE_USAGE_COMMAND("status");
+    PRINT_MODULE_USAGE_COMMAND("stop");
 
     return PX4_OK;
 }
@@ -140,35 +143,26 @@ $ eulernav_bahrs stop
 int EulerNavDriver::print_status()
 {
     if (_is_initialized) {
-        PX4_INFO("EULER-NAV Data Logger Status:");
-        PX4_INFO("Elapsed time: %llu [us]", hrt_elapsed_time(&_statistics._start_time));
-        PX4_INFO("Baud rate: %" PRIu32, _baud_rate);
-        PX4_INFO("Log file: %s", _statistics._log_filename);
-        PX4_INFO("Total bytes received: %" PRIu32, _statistics._total_bytes_received);
-        PX4_INFO("Total bytes written: %" PRIu32, _statistics._total_bytes_written);
-        PX4_INFO("Write errors: %" PRIu32, _statistics._write_errors);
-        PX4_INFO("Buffer overflows: %" PRIu32, _statistics._buffer_overflows);
+        PX4_INFO("EULER-NAV logger:");
+        PX4_INFO("  Elapsed: %llu us", hrt_elapsed_time(&_statistics._start_time));
+        PX4_INFO("  Baud: %" PRIu32, _baud_rate);
+        PX4_INFO("  File: %s", _statistics._log_filename);
+        PX4_INFO("  RX bytes: %" PRIu32, _statistics._total_bytes_received);
+        PX4_INFO("  TX bytes: %" PRIu32, _statistics._total_bytes_written);
+        PX4_INFO("  Write errors: %" PRIu32, _statistics._write_errors);
+        PX4_INFO("  Buffer overflows: %" PRIu32, _statistics._buffer_overflows);
 
-        // Count used buffers
-        int used_buffers = 0;
+        int used = 0;
         for (size_t i = 0; i < NUM_BUFFERS; i++) {
-            if (_buffer_pool[i].in_use) {
-                used_buffers++;
-            }
+            if (_buffer_pool[i].in_use) used++;
         }
-        PX4_INFO("Buffers in use: %d/%zu", used_buffers, NUM_BUFFERS);
+        PX4_INFO("  Buffers in use: %d/%zu", used, NUM_BUFFERS);
 
-        if (_reader_task_id.load() > 0 && _writer_task_id.load() > 0) {
-            PX4_INFO("Reader task: running (id: %d)", _reader_task_id.load());
-            PX4_INFO("Writer task: running (id: %d)", _writer_task_id.load());
-        } else {
-            PX4_INFO("Reader task: %s", _reader_task_id.load() > 0 ? "running" : "stopped");
-            PX4_INFO("Writer task: %s", _writer_task_id.load() > 0 ? "running" : "stopped");
-        }
+        PX4_INFO("  Reader task: %s (id=%d)", _reader_task_id > 0 ? "running" : "stopped", _reader_task_id);
+        PX4_INFO("  Writer task: %s (id=%d)", _writer_task_id > 0 ? "running" : "stopped", _writer_task_id);
     } else {
-        PX4_INFO("Logger is not initialized or failed to start");
+        PX4_INFO("Logger not initialized");
     }
-
     return PX4_OK;
 }
 
@@ -177,35 +171,33 @@ void EulerNavDriver::run()
     _statistics._start_time = hrt_absolute_time();
 
     if (!_is_initialized) {
-        PX4_ERR("Driver not initialized, exiting");
+        PX4_ERR("Not initialized");
         return;
     }
 
-    // Spawn reader task (higher priority)
+    // Spawn reader task (higher prio)
     _reader_task_id = px4_task_spawn_cmd("eulernav_reader",
                                          SCHED_DEFAULT,
-                                         SCHED_PRIORITY_DEFAULT + 5,   // safer than MAX-5
+                                         SCHED_PRIORITY_DEFAULT + 5,
                                          Config::TASK_STACK_SIZE,
                                          (px4_main_t)&EulerNavDriver::readerTaskEntry,
                                          nullptr);
-
     if (_reader_task_id < 0) {
         PX4_ERR("Failed to spawn reader task");
         deinitialize();
         return;
     }
 
-    // Spawn writer task (lower priority)
+    // Spawn writer task (normal prio)
     _writer_task_id = px4_task_spawn_cmd("eulernav_writer",
                                          SCHED_DEFAULT,
                                          SCHED_PRIORITY_DEFAULT,
                                          Config::TASK_STACK_SIZE,
                                          (px4_main_t)&EulerNavDriver::writerTaskEntry,
                                          nullptr);
-
     if (_writer_task_id < 0) {
         PX4_ERR("Failed to spawn writer task");
-        // Let reader run down when stop is requested
+        // Continue running reader until stop is requested
     }
 
     // Monitor until stop requested
@@ -213,32 +205,26 @@ void EulerNavDriver::run()
         px4_usleep(200000); // 200 ms
     }
 
-    // Wait for workers to exit themselves (they check exitRequested())
-    const hrt_abstime t_wait_start = hrt_absolute_time();
-    while (((_reader_task_id.load() > 0) || (_writer_task_id.load() > 0))
-           && (hrt_absolute_time() - t_wait_start < 2_s)) {
+    // Give workers time to exit
+    const hrt_abstime t0 = hrt_absolute_time();
+    while (((_reader_task_id > 0) || (_writer_task_id > 0)) && (hrt_absolute_time() - t0 < 2 * 1000 * 1000)) {
         px4_usleep(50000);
     }
 
     deinitialize();
 }
 
-void EulerNavDriver::readerTaskTrampoline(void *arg)
+// Worker entries (px4_task_spawn_cmd signature)
+int EulerNavDriver::readerTaskEntry(int, char **)
 {
-    EulerNavDriver *driver = static_cast<EulerNavDriver *>(arg);
-    driver->readerTask();
-}
-
-int EulerNavDriver::readerTaskEntry(int, char**)
-{
-    if (!_instance) { return -1; }
+    if (!_instance) return -1;
     _instance->readerTask();
     return 0;
 }
 
-int EulerNavDriver::writerTaskEntry(int, char**)
+int EulerNavDriver::writerTaskEntry(int, char **)
 {
-    if (!_instance) { return -1; }
+    if (!_instance) return -1;
     _instance->writerTask();
     return 0;
 }
@@ -251,7 +237,7 @@ void EulerNavDriver::readerTask()
         DataBuffer *buffer = getAvailableBuffer();
         if (!buffer) {
             _statistics._buffer_overflows++;
-            PX4_WARN("No buffers available for reading, data may be lost");
+            PX4_WARN("No free buffers; data may be lost");
             px4_usleep(1000);
             continue;
         }
@@ -260,10 +246,12 @@ void EulerNavDriver::readerTask()
         bool got_data = false;
 
         while (!exitRequested() && buffer->length < DataBuffer::BUFFER_SIZE) {
-            const auto bytes_read = _serial_port.readAtLeast(_serial_read_buffer, sizeof(_serial_read_buffer),
-                                                             Config::MIN_BYTES_TO_READ, Config::SERIAL_READ_TIMEOUT_US);
+            const auto bytes_read = _serial_port.readAtLeast(_serial_read_buffer,
+                                                             sizeof(_serial_read_buffer),
+                                                             Config::MIN_BYTES_TO_READ,
+                                                             Config::SERIAL_READ_TIMEOUT_US);
             if (bytes_read > 0) {
-                const size_t bytes_to_copy = std::min(static_cast<size_t>(bytes_read),
+                const size_t bytes_to_copy = min_size(static_cast<size_t>(bytes_read),
                                                       DataBuffer::BUFFER_SIZE - buffer->length);
                 memcpy(buffer->data + buffer->length, _serial_read_buffer, bytes_to_copy);
                 buffer->length += bytes_to_copy;
@@ -271,12 +259,12 @@ void EulerNavDriver::readerTask()
                 got_data = true;
 
                 if (bytes_to_copy < static_cast<size_t>(bytes_read)) {
-                    PX4_WARN("Buffer full, %zu bytes dropped", static_cast<size_t>(bytes_read) - bytes_to_copy);
+                    PX4_WARN("Buffer full, dropped %zu bytes", static_cast<size_t>(bytes_read) - bytes_to_copy);
                     _statistics._buffer_overflows++;
                     break;
                 }
             } else if (got_data) {
-                break;
+                break; // timeout with some data -> dispatch
             }
         }
 
@@ -289,13 +277,6 @@ void EulerNavDriver::readerTask()
 
     PX4_INFO("Reader task exiting");
     _reader_task_id = -1;
-    px4_task_exit(0);
-}
-
-void EulerNavDriver::writerTaskTrampoline(void *arg)
-{
-    EulerNavDriver *driver = static_cast<EulerNavDriver *>(arg);
-    driver->writerTask();
 }
 
 void EulerNavDriver::writerTask()
@@ -313,7 +294,7 @@ void EulerNavDriver::writerTask()
         }
 
         if (_log_fd < 0) {
-            PX4_WARN("Log file not open, discarding buffer");
+            PX4_WARN("Log not open, discarding buffer");
             releaseBuffer(buffer);
             continue;
         }
@@ -327,7 +308,7 @@ void EulerNavDriver::writerTask()
                 bytes_since_sync += n;
             } else if (n == 0 || (n < 0 && errno != EINTR)) {
                 _statistics._write_errors++;
-                PX4_WARN("File write error: %s", strerror(errno));
+                PX4_WARN("Write error: %s", strerror(errno));
                 close(_log_fd);
                 _log_fd = -1;
                 (void)createLogFile(); // best effort recovery
@@ -353,7 +334,6 @@ void EulerNavDriver::writerTask()
 
     PX4_INFO("Writer task exiting");
     _writer_task_id = -1;
-    px4_task_exit(0);
 }
 
 bool EulerNavDriver::initialize()
@@ -362,20 +342,17 @@ bool EulerNavDriver::initialize()
         return true;
     }
 
-    // Create log directory
     if (!createDirectory(Config::LOG_DIR_PATH)) {
         PX4_ERR("Failed to create log directory");
         return false;
     }
 
-    // Open serial port
     _serial_port.open();
     if (!_serial_port.isOpen()) {
         PX4_ERR("Failed to open serial port");
         return false;
     }
 
-    // Create log file
     if (!createLogFile()) {
         PX4_ERR("Failed to create log file");
         _serial_port.close();
@@ -383,17 +360,15 @@ bool EulerNavDriver::initialize()
     }
 
     _is_initialized = true;
-    PX4_INFO("EULER-NAV logger initialized successfully");
-    PX4_INFO("Serial port: %s at %" PRIu32 " baud", _device_name, _baud_rate);
-    PX4_INFO("Log file: %s", _statistics._log_filename);
-
+    PX4_INFO("EULER-NAV logger initialized");
+    PX4_INFO("Port: %s @ %" PRIu32, _device_name, _baud_rate);
+    PX4_INFO("File: %s", _statistics._log_filename);
     return true;
 }
 
 void EulerNavDriver::deinitialize()
 {
     if (_log_fd >= 0) {
-        // Ensure data is written to disk
         fsync(_log_fd);
         close(_log_fd);
         _log_fd = -1;
@@ -408,19 +383,16 @@ void EulerNavDriver::deinitialize()
 
 bool EulerNavDriver::createDirectory(const char* path)
 {
-    struct stat st;
+    struct stat st{};
     if (stat(path, &st) == 0) {
         return S_ISDIR(st.st_mode);
     }
 
-    // Try to create the directory
     if (mkdir(path, 0755) == 0) {
         return true;
     }
 
-    // If mkdir failed, check if parent directory exists
     if (errno == ENOENT) {
-        // Try to create parent directory first
         char parent_path[128];
         strncpy(parent_path, path, sizeof(parent_path) - 1);
         parent_path[sizeof(parent_path) - 1] = '\0';
@@ -439,22 +411,19 @@ bool EulerNavDriver::createDirectory(const char* path)
 
 void EulerNavDriver::generateFilename(char* buffer, size_t buffer_size)
 {
-    struct timespec ts;
-    struct tm tm_info; // Use a local struct for the result
+    struct timespec ts{};
+    struct tm tm_info{};
 
-    // Try to get current time
     if (clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.tv_sec > 1000000000) {
-        // Use thread-safe localtime_r
         if (localtime_r(&ts.tv_sec, &tm_info)) {
             snprintf(buffer, buffer_size, "%s/eulernav_log_%04d%02d%02d_%02d%02d%02d.bin",
                      Config::LOG_DIR_PATH,
                      tm_info.tm_year + 1900, tm_info.tm_mon + 1, tm_info.tm_mday,
                      tm_info.tm_hour, tm_info.tm_min, tm_info.tm_sec);
-            return; // Exit after successful generation
+            return;
         }
     }
 
-    // Fallback to sequential numbering if time functions fail
     static uint32_t file_counter = 0;
     snprintf(buffer, buffer_size, "%s/eulernav_log_%06" PRIu32 ".bin",
              Config::LOG_DIR_PATH, ++file_counter);
@@ -463,33 +432,24 @@ void EulerNavDriver::generateFilename(char* buffer, size_t buffer_size)
 bool EulerNavDriver::createLogFile()
 {
     char filename[128];
-    struct stat st;
+    struct stat st{};
 
-    // Generate filename and ensure it's unique
     for (int attempts = 0; attempts < 1000; attempts++) {
         generateFilename(filename, sizeof(filename));
-
         if (stat(filename, &st) != 0) {
-            // File doesn't exist, we can use this name
-            break;
+            break; // name is free
         }
-
-        // File exists, wait a bit and try again
         px4_usleep(1000);
     }
 
-    // Create and open the file with standard permissions (0644)
     _log_fd = open(filename, O_CREAT | O_WRONLY | O_EXCL, 0644);
-
     if (_log_fd < 0) {
         PX4_ERR("Failed to create log file %s: %s", filename, strerror(errno));
         return false;
     }
 
-    // Store filename for status reporting
     strncpy(_statistics._log_filename, filename, sizeof(_statistics._log_filename) - 1);
     _statistics._log_filename[sizeof(_statistics._log_filename) - 1] = '\0';
-
     return true;
 }
 
@@ -498,69 +458,71 @@ void EulerNavDriver::queueFilledBuffer(DataBuffer* buffer)
     if (!buffer || !buffer->in_use) {
         return;
     }
-    // Push buffer index into SPSC queue
-    const uint8_t idx = static_cast<uint8_t>(buffer - _buffer_pool);
-    const uint8_t next_tail = static_cast<uint8_t>((_filled_tail.load() + 1) % NUM_BUFFERS);
 
-    // Simple overflow protection: if queue is full, drop and count overflow
-    if (next_tail == _filled_head.load()) {
+    const uint8_t idx = static_cast<uint8_t>(buffer - _buffer_pool);
+    const uint8_t next_tail = static_cast<uint8_t>((_filled_tail + 1) % NUM_BUFFERS);
+
+    // Queue full -> drop and mark overflow
+    if (next_tail == _filled_head) {
         _statistics._buffer_overflows++;
         PX4_WARN("Filled queue overflow, dropping buffer");
-        // Do not release here; writer won't see it. Release it for reuse.
         releaseBuffer(buffer);
         return;
     }
 
-    _filled_queue[_filled_tail.load()] = idx;
-    _filled_tail.store(next_tail);
+    _filled_queue[_filled_tail] = idx;
+    _filled_tail = next_tail;
 
-    // Signal one filled buffer available
     px4_sem_post(&_filled_buffers_sem);
 }
 
+// ...existing code...
 DataBuffer* EulerNavDriver::getNextFilledBuffer()
 {
-    if (px4_sem_timedwait(&_filled_buffers_sem, 100000) != 0) {
-        return nullptr;
-    }
+    struct timespec abstime{};
+    make_abstime_us(abstime, 100000); // 100 ms
+    if (px4_sem_timedwait(&_filled_buffers_sem, &abstime) != 0) {
+         return nullptr;
+     }
 
-    // Pop index from SPSC queue
-    const uint8_t head = _filled_head.load();
-    if (head == _filled_tail.load()) {
-        // Should not happen due to semaphore, but guard anyway
-        return nullptr;
-    }
+     const uint8_t head = _filled_head;
+     if (head == _filled_tail) {
+         return nullptr; // should not happen
+     }
 
-    const uint8_t idx = _filled_queue[head];
-    _filled_head.store(static_cast<uint8_t>((head + 1) % NUM_BUFFERS));
-
-    return &_buffer_pool[idx];
+     const uint8_t idx = _filled_queue[head];
+     _filled_head = static_cast<uint8_t>((head + 1) % NUM_BUFFERS);
+     return &_buffer_pool[idx];
 }
+// ...existing code...
 
+// ...existing code...
 DataBuffer* EulerNavDriver::getAvailableBuffer()
 {
-    if (px4_sem_timedwait(&_free_buffers_sem, 100000) != 0) {
-        return nullptr;
-    }
+    struct timespec abstime{};
+    make_abstime_us(abstime, 100000); // 100 ms
+    if (px4_sem_timedwait(&_free_buffers_sem, &abstime) != 0) {
+         return nullptr;
+     }
 
-    for (size_t i = 0; i < NUM_BUFFERS; i++) {
-        uint8_t idx = (_next_fill_index.load() + i) % NUM_BUFFERS;
-        if (!_buffer_pool[idx].in_use) {
-            _buffer_pool[idx].in_use = true;
-            _buffer_pool[idx].length = 0;
-            _next_fill_index = static_cast<uint8_t>((idx + 1) % NUM_BUFFERS);
-            return &_buffer_pool[idx];
-        }
-    }
+     for (size_t i = 0; i < NUM_BUFFERS; i++) {
+         uint8_t idx = static_cast<uint8_t>((_next_fill_index + i) % NUM_BUFFERS);
+         if (!_buffer_pool[idx].in_use) {
+             _buffer_pool[idx].in_use = true;
+             _buffer_pool[idx].length = 0;
+             _next_fill_index = static_cast<uint8_t>((idx + 1) % NUM_BUFFERS);
+             return &_buffer_pool[idx];
+         }
+     }
 
-    // Shouldn't happen due to semaphore
-    px4_sem_post(&_free_buffers_sem);
-    return nullptr;
+     // Shouldn't happen due to semaphore
+     px4_sem_post(&_free_buffers_sem);
+     return nullptr;
 }
 
 void EulerNavDriver::releaseBuffer(DataBuffer* buffer)
 {
-    if (!buffer) { return; }
+    if (!buffer) return;
     buffer->in_use = false;
     buffer->length = 0;
     px4_sem_post(&_free_buffers_sem);

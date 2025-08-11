@@ -267,53 +267,89 @@ void EulerNavDriver::readerTask()
     PX4_INFO("Reader task started");
     _reader_running = true;
 
-   _serial_port.open();
+    _serial_port.open();
 
-   if (!_serial_port.isOpen()) {
-       PX4_ERR("Reader: Failed to open serial port %s", _device_name);
-       _reader_running = false;
-       return;
-   }
+    if (!_serial_port.isOpen()) {
+        PX4_ERR("Reader: Failed to open serial port %s", _device_name);
+        _reader_running = false;
+        return;
+    }
 
-   PX4_INFO("Reader: Serial port opened successfully");
+    PX4_INFO("Reader: Serial port opened successfully");
 
     while (!exitRequested()) {
-        // 1. Get a buffer to fill. This will block if none are free.
+        // Get a 16KB buffer to pack data into
         DataBuffer *buffer = getAvailableBuffer();
 
         if (!buffer) {
-            // This case happens if the getAvailableBuffer semaphore times out.
-            // It implies the writer is stuck and not releasing buffers.
             _statistics._buffer_overflows++;
-            // A small sleep is good to prevent spamming if we are in a bad state.
-            px4_usleep(100000);
+            px4_usleep(10000); // 10ms
             continue;
         }
 
-        // 2. Attempt to read from the serial port.
-        const auto bytes_read = _serial_port.readAtLeast(buffer->data, DataBuffer::BUFFER_SIZE, DataBuffer::BUFFER_SIZE, 100000);
+        buffer->length = 0;
+        bool got_any_data = false;
+        hrt_abstime last_data_time = hrt_absolute_time();
 
-        if (bytes_read > 0) {
-            // 3a. If we got data, queue the buffer for the writer.
-            buffer->length = bytes_read;
-            _statistics._total_bytes_received += bytes_read;
+        // Pack data into the 16KB buffer until it's full or we timeout
+        while (buffer->length < DataBuffer::BUFFER_SIZE) {
+            // Check if we have enough space left to bother reading
+            const size_t space_left = DataBuffer::BUFFER_SIZE - buffer->length;
+            if (space_left < 12) {
+                // Not enough space for a minimum read, dispatch what we have
+                break;
+            }
+
+            // Read into the small intermediate buffer with short timeout
+            const auto bytes_read = _serial_port.readAtLeast(_serial_read_buffer,
+                                      min_size(sizeof(_serial_read_buffer), space_left),
+                                      12,
+                                      5000); // 5ms timeout (matches burst interval)
+
+            if (bytes_read > 0) {
+                // Copy data from intermediate buffer to the main buffer
+                memcpy(buffer->data + buffer->length, _serial_read_buffer, bytes_read);
+                buffer->length += bytes_read;
+                _statistics._total_bytes_received += bytes_read;
+                got_any_data = true;
+                last_data_time = hrt_absolute_time();
+
+                // If the buffer is now full or nearly full, dispatch it
+                if (DataBuffer::BUFFER_SIZE - buffer->length < 12) {
+                    break;
+                }
+            } else {
+                // No data received in this 5ms window
+                if (got_any_data) {
+                    // Check if we should dispatch partial buffer
+                    const hrt_abstime now = hrt_absolute_time();
+
+                    // Dispatch if:
+                    // 1. We have at least 1KB of data AND no new data for 20ms, OR
+                    // 2. We have any data and no new data for 100ms
+                    if (((buffer->length >= (DataBuffer::BUFFER_SIZE / 2)) && ((now - last_data_time) > 100'000)) ||
+                        (now - last_data_time) > 1'000'000) {
+                        break; // Dispatch partial buffer
+                    }
+                } else {
+                    // No data at all, break to try again with a fresh buffer
+                    break;
+                }
+            }
+        }
+
+        if (got_any_data) {
+            // Dispatch the packed buffer (full or partial)
             queueFilledBuffer(buffer);
-
         } else {
-            // 3b. If we got no data (timeout), release the buffer immediately
-            // so it can be used again.
+            // No data received, release the buffer
             releaseBuffer(buffer);
-
-            // IMPORTANT: Add a small delay to prevent a tight busy-loop
-            // when no data is available. This yields CPU to other tasks.
-            px4_usleep(1000); // 1ms sleep
         }
     }
 
-   // Close serial port in the reader task
-   if (_serial_port.isOpen()) {
-       _serial_port.close();
-   }
+    if (_serial_port.isOpen()) {
+        _serial_port.close();
+    }
 
     PX4_INFO("Reader task exiting");
     _reader_running = false;

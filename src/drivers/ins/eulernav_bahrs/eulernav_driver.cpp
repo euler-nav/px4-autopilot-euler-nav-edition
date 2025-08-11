@@ -223,7 +223,7 @@ void EulerNavDriver::run()
 
     // Monitor until stop requested
     while (!should_exit()) {
-        px4_usleep(200000); // 200 ms
+        px4_usleep(200'000); // 200 ms
     }
 
     // Give workers time to exit
@@ -235,7 +235,7 @@ void EulerNavDriver::run()
             break;
         }
 
-        px4_usleep(50000);
+        px4_usleep(50'000);
     }
 
     // Clean up task IDs for the status command
@@ -295,7 +295,7 @@ void EulerNavDriver::readerTask()
         while (buffer->length < DataBuffer::BUFFER_SIZE) {
             // Check if we have enough space left to bother reading
             const size_t space_left = DataBuffer::BUFFER_SIZE - buffer->length;
-            if (space_left < 12) {
+            if (space_left < Config::MIN_BYTES_TO_READ) {
                 // Not enough space for a minimum read, dispatch what we have
                 break;
             }
@@ -303,8 +303,8 @@ void EulerNavDriver::readerTask()
             // Read into the small intermediate buffer with short timeout
             const auto bytes_read = _serial_port.readAtLeast(_serial_read_buffer,
                                       min_size(sizeof(_serial_read_buffer), space_left),
-                                      12,
-                                      5000); // 5ms timeout (matches burst interval)
+                                      Config::MIN_BYTES_TO_READ,
+                                      Config::SERIAL_READ_TIMEOUT_US); // 5ms timeout (matches burst interval)
 
             if (bytes_read > 0) {
                 // Copy data from intermediate buffer to the main buffer
@@ -315,7 +315,7 @@ void EulerNavDriver::readerTask()
                 last_data_time = hrt_absolute_time();
 
                 // If the buffer is now full or nearly full, dispatch it
-                if (DataBuffer::BUFFER_SIZE - buffer->length < 12) {
+                if (DataBuffer::BUFFER_SIZE - buffer->length < Config::MIN_BYTES_TO_READ) {
                     break;
                 }
             } else {
@@ -327,8 +327,8 @@ void EulerNavDriver::readerTask()
                     // Dispatch if:
                     // 1. We have at least 1KB of data AND no new data for 20ms, OR
                     // 2. We have any data and no new data for 100ms
-                    if (((buffer->length >= (DataBuffer::BUFFER_SIZE / 2)) && ((now - last_data_time) > 100'000)) ||
-                        (now - last_data_time) > 1'000'000) {
+                    if (((buffer->length >= (DataBuffer::BUFFER_SIZE / 2)) && ((now - last_data_time) > Config::PARTIAL_BUFFER_TIMEOUT_US)) ||
+                        (now - last_data_time) > Config::MAX_PARTIAL_BUFFER_TIMEOUT_US) {
                         break; // Dispatch partial buffer
                     }
                 } else {
@@ -401,7 +401,7 @@ void EulerNavDriver::writerTask()
 
         const hrt_abstime now = hrt_absolute_time();
 
-        if ((bytes_since_sync > 1048576) || (now - last_sync_time > 5000000)) {
+        if ((bytes_since_sync > 1'048'576) || (now - last_sync_time > 5'000'000)) {
             if (_log_fd >= 0) {
                 fsync(_log_fd);
             }

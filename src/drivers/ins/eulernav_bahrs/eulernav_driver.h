@@ -52,8 +52,10 @@ private:
     struct Config {
         static constexpr uint32_t TASK_STACK_SIZE{3072};
         static constexpr uint32_t SERIAL_READ_BUFFER_SIZE{1024};
-        static constexpr uint32_t MIN_BYTES_TO_READ{16};
-        static constexpr uint32_t SERIAL_READ_TIMEOUT_US{100000};
+        static constexpr uint32_t MIN_BYTES_TO_READ{12};
+        static constexpr uint32_t SERIAL_READ_TIMEOUT_US{5000};
+        static constexpr uint32_t PARTIAL_BUFFER_TIMEOUT_US{100'000};
+        static constexpr uint32_t MAX_PARTIAL_BUFFER_TIMEOUT_US{1'000'000};
         static constexpr const char *LOG_DIR_PATH{"/fs/microsd/log/eulernav"};
     };
 
